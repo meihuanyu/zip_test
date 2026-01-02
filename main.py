@@ -8,6 +8,7 @@ import wave
 import io
 import json
 import re
+import time
 from typing import Optional, Tuple, List, Dict, Union
 from collections import defaultdict
 from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
@@ -172,7 +173,7 @@ async def websocket_alignment(websocket: WebSocket):
         
         # 累积音频缓冲区
         audio_buffer = np.array([], dtype=np.float32)
-        min_chunk_size = int(SAMPLE_RATE * 0.47)  # 保持 0.47s 缓冲
+        min_chunk_size = int(SAMPLE_RATE * 0.2)  # 保持 0.47s 缓冲
         last_sent_index = -1
         total_samples = 0
         
@@ -190,11 +191,18 @@ async def websocket_alignment(websocket: WebSocket):
                 
                 # 当累积足够的数据时再处理
                 if len(audio_buffer) >= min_chunk_size:
+                    current_buffer_len = len(audio_buffer)
+                    t_start_infer = time.perf_counter()
+                    
                     # 处理累积的音频数据
                     stream.accept_waveform(SAMPLE_RATE, audio_buffer.astype(np.float32))
                     
+                    decode_count = 0
                     while recognizer.is_ready(stream):
                         recognizer.decode_stream(stream)
+                        decode_count += 1
+                    
+                    t_end_infer = time.perf_counter()
                     
                     total_samples += len(audio_buffer)
                     current_time = total_samples / SAMPLE_RATE
@@ -203,6 +211,7 @@ async def websocket_alignment(websocket: WebSocket):
                     audio_buffer = np.array([], dtype=np.float32)
                     
                     # 获取当前识别结果
+                    t_start_align = time.perf_counter()
                     result = recognizer.get_result_all(stream)
                     # 处理新 Tokens
                     if hasattr(result, 'tokens'):
@@ -232,6 +241,15 @@ async def websocket_alignment(websocket: WebSocket):
                                         last_sent_index = event['index']
                             
                             processed_token_count = len(tokens)
+                    
+                    t_end_align = time.perf_counter()
+                    
+                    # 打印性能统计
+                    audio_duration_ms = (current_buffer_len / SAMPLE_RATE) * 1000
+                    infer_ms = (t_end_infer - t_start_infer) * 1000
+                    align_ms = (t_end_align - t_start_align) * 1000
+                    rtf = infer_ms / audio_duration_ms if audio_duration_ms > 0 else 0
+                    # print(f"[Perf] Audio: {audio_duration_ms:.1f}ms | Infer: {infer_ms:.1f}ms (x{decode_count}) | Align: {align_ms:.1f}ms | RTF: {rtf:.2f}")
             
             elif "text" in data:
                 # 接收文本消息（如停止信号）

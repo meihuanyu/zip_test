@@ -111,35 +111,37 @@ class StreamingAligner:
             return None
 
         # 策略 B: Lookahead (跳字处理)
-        search_window = 20
-        search_limit = min(len(self.clean_target), temp_ptr + search_window)
-        
-        found_offset = -1
-        for i in range(1, search_window):
-            check_pos = temp_ptr + i
-            if check_pos >= search_limit:
-                break
-            if self.clean_target[check_pos] == ' ':
-                continue
-            if self.clean_target[check_pos:].startswith(token_str):
-                found_offset = check_pos
-                break
-        
-        if found_offset != -1:
-            print(f"[Aligner] Lookahead matched: skipped {found_offset - temp_ptr} chars (token: {token_str})")
-            new_ptr = found_offset + len(token_str)
-            match_end_idx = new_ptr - 1
-            if match_end_idx < len(self.word_map):
-                word_idx = self.word_map[match_end_idx]
-                self.ptr = new_ptr
-                if word_idx != -1:
-                    adjusted_start = max(0.0, start - 0.03)
-                    return {
-                        "index": word_idx,
-                        "text": raw_token,
-                        "start": adjusted_start,
-                        "end": end if end > 0 else start + 0.04
-                    }
+        # 只有当 token 足够长时才启用 Lookahead，防止像 'a', 'e' 这种短 token 误匹配导致跳过正常文本
+        if len(token_str) > 1:
+            search_window = 20
+            search_limit = min(len(self.clean_target), temp_ptr + search_window)
+            
+            found_offset = -1
+            for i in range(1, search_window):
+                check_pos = temp_ptr + i
+                if check_pos >= search_limit:
+                    break
+                if self.clean_target[check_pos] == ' ':
+                    continue
+                if self.clean_target[check_pos:].startswith(token_str):
+                    found_offset = check_pos
+                    break
+            
+            if found_offset != -1:
+                print(f"[Aligner] Lookahead matched: skipped {found_offset - temp_ptr} chars (token: {token_str})")
+                new_ptr = found_offset + len(token_str)
+                match_end_idx = new_ptr - 1
+                if match_end_idx < len(self.word_map):
+                    word_idx = self.word_map[match_end_idx]
+                    self.ptr = new_ptr
+                    if word_idx != -1:
+                        adjusted_start = max(0.0, start - 0.03)
+                        return {
+                            "index": word_idx,
+                            "text": raw_token,
+                            "start": adjusted_start,
+                            "end": end if end > 0 else start + 0.04
+                        }
 
         # 策略 C: 容错
         print(f"[Aligner] Mismatch: token='{token_str}' vs target='{self.clean_target[temp_ptr:temp_ptr+10]}...'")
