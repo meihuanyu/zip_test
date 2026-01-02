@@ -1,11 +1,17 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 import sherpa_onnx
 import numpy as np
 import wave
 import io
-from typing import Optional, Tuple
+import json
+import re
+from typing import Optional, Tuple, List, Dict, Union
+from collections import defaultdict
+from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
+from streaming_aligner import StreamingAligner
 
 app = FastAPI()
 
@@ -15,6 +21,17 @@ TOKENS_PATH = "tokens.txt"
 SAMPLE_RATE = 16000
 
 recognizer = None
+
+# 存储每个WebSocket连接的stream
+streams: Dict[str, sherpa_onnx.OnlineStream] = {}
+
+async def safe_send_json(websocket: WebSocket, data: dict):
+    """安全地发送JSON数据，如果连接已关闭则忽略异常"""
+    try:
+        await websocket.send_json(data)
+    except (ConnectionClosedOK, ConnectionClosedError, WebSocketDisconnect):
+        # 连接已关闭，忽略错误
+        pass
 
 def load_model():
     """加载 sherpa-onnx CTC 模型和 tokens"""
@@ -77,6 +94,12 @@ def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarra
     indices = np.linspace(0, len(audio) - 1, n_samples)
     return np.interp(indices, np.arange(len(audio)), audio)
 
+def parse_audio_from_bytes(audio_bytes: bytes) -> np.ndarray:
+    """从PCM字节流解析音频数据（16位小端序）"""
+    audio = np.frombuffer(audio_bytes, dtype=np.int16)
+    audio = audio.astype(np.float32) / 32768.0
+    return audio
+
 @app.post("/api/transcribe")
 async def transcribe_audio(file: UploadFile = File(...)):
     """使用 sherpa-onnx 流式转录音频文件"""
@@ -106,7 +129,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
         
         # 输入完成，获取最终结果
         stream.input_finished()
-        result = recognizer.get_result(stream)
+        result = recognizer.get_result_all(stream)
         
         return {
             "text": result.text if hasattr(result, 'text') else str(result),
@@ -117,10 +140,135 @@ async def transcribe_audio(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"处理失败: {str(e)}")
 
+class AlignmentRequest(BaseModel):
+    text: str
+    
+@app.websocket("/api/alignment/ws")
+async def websocket_alignment(websocket: WebSocket):
+    """WebSocket端点：实时接收音频流并进行对齐"""
+    await websocket.accept()
+    stream_id = str(id(websocket))
+    
+    if recognizer is None:
+        print("[WebSocket] 错误: 模型未加载")
+        await safe_send_json(websocket, {"error": "模型未加载"})
+        await websocket.close()
+        return
+    
+    try:
+        # 创建新的stream
+        stream = recognizer.create_stream()
+        streams[stream_id] = stream
+        
+        # 接收参考文本
+        init_data = await websocket.receive_json()
+        reference_text = init_data.get("text", "")
+        
+        # 初始化对齐器
+        aligner = StreamingAligner(reference_text, TOKENS_PATH)
+        processed_token_count = 0
+        
+        await safe_send_json(websocket, {"status": "ready"})
+        
+        # 累积音频缓冲区
+        audio_buffer = np.array([], dtype=np.float32)
+        min_chunk_size = int(SAMPLE_RATE * 0.47)  # 保持 0.47s 缓冲
+        last_sent_index = -1
+        total_samples = 0
+        
+        while True:
+            # 接收音频数据
+            data = await websocket.receive()
+            
+            if "bytes" in data:
+                # 接收PCM音频数据
+                audio_bytes = data["bytes"]
+                audio_chunk = parse_audio_from_bytes(audio_bytes)
+                
+                # 累积音频数据
+                audio_buffer = np.concatenate([audio_buffer, audio_chunk])
+                
+                # 当累积足够的数据时再处理
+                if len(audio_buffer) >= min_chunk_size:
+                    # 处理累积的音频数据
+                    stream.accept_waveform(SAMPLE_RATE, audio_buffer.astype(np.float32))
+                    
+                    while recognizer.is_ready(stream):
+                        recognizer.decode_stream(stream)
+                    
+                    total_samples += len(audio_buffer)
+                    current_time = total_samples / SAMPLE_RATE
+                    
+                    # 清空缓冲区
+                    audio_buffer = np.array([], dtype=np.float32)
+                    
+                    # 获取当前识别结果
+                    result = recognizer.get_result_all(stream)
+                    # 处理新 Tokens
+                    if hasattr(result, 'tokens'):
+                        tokens = result.tokens
+                        timestamps = result.timestamps if hasattr(result, 'timestamps') else []
+                        
+                        if len(tokens) > processed_token_count:
+                            new_tokens = tokens[processed_token_count:]
+                            print(f"[DEBUG] New tokens ({len(new_tokens)}): {new_tokens}")
+                            
+                            for i, token in enumerate(new_tokens):
+                                idx = processed_token_count + i
+                                # 获取对应的时间戳，如果没有则用当前时间估算
+                                t_start = timestamps[idx] if idx < len(timestamps) else current_time
+                                t_end = -1.0 # aligner 会估算
+                                
+                                event = aligner.process_token(token, t_start, t_end)
+                                if event:
+                                    # 只有索引向前推进时才发送
+                                    if event['index'] != last_sent_index:
+                                        print(f"[WebSocket] 匹配: 索引={event['index']}, 文本={event['text']}, 时间={event['start']:.2f}s")
+                                        await safe_send_json(websocket, {
+                                            "index": event['index'],
+                                            "current_time": event['start'],
+                                            "recognized_text": event['text']
+                                        })
+                                        last_sent_index = event['index']
+                            
+                            processed_token_count = len(tokens)
+            
+            elif "text" in data:
+                # 接收文本消息（如停止信号）
+                msg = json.loads(data["text"])
+                if msg.get("action") == "stop":
+                    # 处理缓冲区中剩余的音频数据
+                    if len(audio_buffer) > 0:
+                        stream.accept_waveform(SAMPLE_RATE, audio_buffer.astype(np.float32))
+                        while recognizer.is_ready(stream):
+                            recognizer.decode_stream(stream)
+                    
+                    stream.input_finished()
+                    print(f"[WebSocket] Stream Stop.")
+                    break
+    
+    except WebSocketDisconnect:
+        print(f"[WebSocket] 连接断开: {stream_id}")
+    except Exception as e:
+        print(f"[WebSocket] 错误: {e}")
+        import traceback
+        traceback.print_exc()
+        await safe_send_json(websocket, {"error": str(e)})
+    finally:
+        if stream_id in streams:
+            del streams[stream_id]
+            print(f"[WebSocket] 清理stream: {stream_id}")
+
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
     """返回 Web UI"""
     with open("static/index.html", "r", encoding="utf-8") as f:
+        return f.read()
+
+@app.get("/alignment", response_class=HTMLResponse)
+async def alignment_page():
+    """返回对齐页面"""
+    with open("static/alignment.html", "r", encoding="utf-8") as f:
         return f.read()
 
 # 挂载静态文件
