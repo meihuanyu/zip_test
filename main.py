@@ -173,7 +173,7 @@ async def websocket_alignment(websocket: WebSocket):
         
         # 累积音频缓冲区
         audio_buffer = np.array([], dtype=np.float32)
-        min_chunk_size = int(SAMPLE_RATE * 0.2)  # 保持 0.47s 缓冲
+        min_chunk_size = int(SAMPLE_RATE * 0.4)  # 保持 0.47s 缓冲
         last_sent_index = -1
         total_samples = 0
         
@@ -221,6 +221,14 @@ async def websocket_alignment(websocket: WebSocket):
                         if len(tokens) > processed_token_count:
                             new_tokens = tokens[processed_token_count:]
                             print(f"[DEBUG] New tokens ({len(new_tokens)}): {new_tokens}")
+                            
+                            # 发送 new_tokens 用于调试
+                            await safe_send_json(websocket, {
+                                "new_tokens": new_tokens,
+                                "token_count": len(new_tokens),
+                                "total_tokens": len(tokens),
+                                "current_time": current_time
+                            })
                             
                             for i, token in enumerate(new_tokens):
                                 idx = processed_token_count + i
@@ -287,6 +295,12 @@ async def read_root():
 async def alignment_page():
     """返回对齐页面"""
     with open("static/alignment.html", "r", encoding="utf-8") as f:
+        return f.read()
+
+@app.get("/debug-tokens", response_class=HTMLResponse)
+async def debug_tokens_page():
+    """返回 new_tokens 调试页面"""
+    with open("static/debug_tokens.html", "r", encoding="utf-8") as f:
         return f.read()
 
 # 挂载静态文件

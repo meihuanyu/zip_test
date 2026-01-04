@@ -11,4 +11,4 @@ venv/
 *.mp3
 *.flac
 .DS_Store
-
+*.onnx
