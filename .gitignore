@@ -12,3 +12,4 @@ venv/
 *.flac
 .DS_Store
 *.onnx
+data
