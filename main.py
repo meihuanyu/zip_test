@@ -13,18 +13,26 @@ from typing import Optional, Tuple, List, Dict, Union
 from collections import defaultdict
 from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 from streaming_aligner import StreamingAligner
+from simple_inference import StreamingInference
 
 app = FastAPI()
 
 # 模型配置路径（请根据实际情况修改）
-ENCODER_PATH = "ctc-epoch-18-avg-1-chunk-16-left-128.onnx"
+ENCODER_PATH = "data/ctc-epoch-30-avg-1-chunk-16-left-128.onnx"
 TOKENS_PATH = "tokens.txt"
 SAMPLE_RATE = 16000
 
+# 新的推理模型配置
+ONNX_MODEL_PATH = "data/ctc-epoch-30-avg-1-chunk-16-left-128.onnx"  # 根据实际情况修改
+BPE_MODEL_PATH = "data/lang_bpe_500/bpe.model"  # 根据实际情况修改
+
 recognizer = None
+streaming_inference: Optional[StreamingInference] = None
 
 # 存储每个WebSocket连接的stream
 streams: Dict[str, sherpa_onnx.OnlineStream] = {}
+# 存储每个WebSocket连接的StreamingInference实例
+inference_instances: Dict[str, StreamingInference] = {}
 
 async def safe_send_json(websocket: WebSocket, data: dict):
     """安全地发送JSON数据，如果连接已关闭则忽略异常"""
@@ -55,9 +63,26 @@ def load_model():
         print(f"模型加载失败: {e}")
         recognizer = None
 
+def load_streaming_inference():
+    """加载 StreamingInference 模型"""
+    global streaming_inference
+    try:
+        streaming_inference = StreamingInference(
+            onnx_model_path=ONNX_MODEL_PATH,
+            bpe_model_path=BPE_MODEL_PATH,
+            sample_rate=SAMPLE_RATE,
+        )
+        print(f"StreamingInference 模型加载成功")
+        print(f"  - ONNX Model: {ONNX_MODEL_PATH}")
+        print(f"  - BPE Model: {BPE_MODEL_PATH}")
+    except Exception as e:
+        print(f"StreamingInference 模型加载失败: {e}")
+        streaming_inference = None
+
 @app.on_event("startup")
 async def startup_event():
     load_model()
+    load_streaming_inference()
 
 def read_wav_bytes(audio_data: bytes) -> Tuple[np.ndarray, int]:
     """从字节流读取 WAV 音频数据"""
@@ -197,10 +222,8 @@ async def websocket_alignment(websocket: WebSocket):
                     # 处理累积的音频数据
                     stream.accept_waveform(SAMPLE_RATE, audio_buffer.astype(np.float32))
                     
-                    decode_count = 0
                     while recognizer.is_ready(stream):
                         recognizer.decode_stream(stream)
-                        decode_count += 1
                     
                     t_end_infer = time.perf_counter()
                     
@@ -285,6 +308,80 @@ async def websocket_alignment(websocket: WebSocket):
             del streams[stream_id]
             print(f"[WebSocket] 清理stream: {stream_id}")
 
+@app.websocket("/api/inference/ws")
+async def websocket_inference(websocket: WebSocket):
+    """WebSocket端点：使用 StreamingInference 进行实时推理和对齐"""
+    await websocket.accept()
+    stream_id = str(id(websocket))
+    
+    if streaming_inference is None:
+        print("[WebSocket] 错误: StreamingInference 模型未加载")
+        await safe_send_json(websocket, {"error": "模型未加载"})
+        await websocket.close()
+        return
+    
+    try:
+        # 为每个连接创建新的实例（因为每个连接需要独立的状态）
+        inference = StreamingInference(
+            onnx_model_path=ONNX_MODEL_PATH,
+            bpe_model_path=BPE_MODEL_PATH,
+            sample_rate=SAMPLE_RATE,
+        )
+        inference_instances[stream_id] = inference
+        
+        # 接收参考文本
+        init_data = await websocket.receive_json()
+        reference_text = init_data.get("text", "")
+        
+        if not reference_text:
+            await safe_send_json(websocket, {"error": "参考文本不能为空"})
+            await websocket.close()
+            return
+        
+        # 初始化对齐任务
+        inference.start_alignment(reference_text)
+        await safe_send_json(websocket, {"status": "ready"})
+        
+        while True:
+            # 接收音频数据
+            data = await websocket.receive()
+            
+            if "bytes" in data:
+                # 接收PCM音频数据（16位小端序）
+                audio_bytes = data["bytes"]
+                audio_chunk = parse_audio_from_bytes(audio_bytes)
+                
+                # 处理音频块
+                result = inference.process_audio_chunk(audio_chunk)
+                
+                if result is not None:
+                    # 发送结果
+                    await safe_send_json(websocket, {
+                        "current_phone": result["current_phone"],
+                        "token_index": result["token_index"],
+                        "aligned_text": result["aligned_text"],
+                        "status": "processing"
+                    })
+            
+            elif "text" in data:
+                # 接收文本消息（如停止信号）
+                msg = json.loads(data["text"])
+                if msg.get("action") == "stop":
+                    print(f"[WebSocket] Stream Stop: {stream_id}")
+                    break
+    
+    except WebSocketDisconnect:
+        print(f"[WebSocket] 连接断开: {stream_id}")
+    except Exception as e:
+        print(f"[WebSocket] 错误: {e}")
+        import traceback
+        traceback.print_exc()
+        await safe_send_json(websocket, {"error": str(e)})
+    finally:
+        if stream_id in inference_instances:
+            del inference_instances[stream_id]
+            print(f"[WebSocket] 清理inference实例: {stream_id}")
+
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
     """返回 Web UI"""
@@ -303,9 +400,15 @@ async def debug_tokens_page():
     with open("static/debug_tokens.html", "r", encoding="utf-8") as f:
         return f.read()
 
+@app.get("/simple", response_class=HTMLResponse)
+async def simple_page():
+    """返回简单推理测试页面"""
+    with open("static/simple.html", "r", encoding="utf-8") as f:
+        return f.read()
+
 # 挂载静态文件
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8068)
