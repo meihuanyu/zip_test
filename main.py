@@ -13,7 +13,10 @@ from typing import Optional, Tuple, List, Dict, Union
 from collections import defaultdict
 from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 from streaming_aligner import StreamingAligner
-from simple_inference import StreamingInference
+import sentencepiece as spm
+import torch
+from example_onnx_inference import SimpleOnnxModel, extract_fbank
+from ctc_align_beam import StreamingCTCAligner, AlignConfig
 
 app = FastAPI()
 
@@ -27,12 +30,12 @@ ONNX_MODEL_PATH = "data/ctc-epoch-30-avg-1-chunk-16-left-128.onnx"  # 根据实�
 BPE_MODEL_PATH = "data/lang_bpe_500/bpe.model"  # 根据实际情况修改
 
 recognizer = None
-streaming_inference: Optional[StreamingInference] = None
+bpe_model: Optional[spm.SentencePieceProcessor] = None
 
-# 存储每个WebSocket连接的stream
-streams: Dict[str, sherpa_onnx.OnlineStream] = {}
-# 存储每个WebSocket连接的StreamingInference实例
-inference_instances: Dict[str, StreamingInference] = {}
+# 存储每个WebSocket连接的SimpleOnnxModel实例和对齐器
+phoneme_models: Dict[str, SimpleOnnxModel] = {}
+phoneme_aligners: Dict[str, StreamingCTCAligner] = {}
+phoneme_bpe_models: Dict[str, spm.SentencePieceProcessor] = {}
 
 async def safe_send_json(websocket: WebSocket, data: dict):
     """安全地发送JSON数据，如果连接已关闭则忽略异常"""
@@ -63,26 +66,9 @@ def load_model():
         print(f"模型加载失败: {e}")
         recognizer = None
 
-def load_streaming_inference():
-    """加载 StreamingInference 模型"""
-    global streaming_inference
-    try:
-        streaming_inference = StreamingInference(
-            onnx_model_path=ONNX_MODEL_PATH,
-            bpe_model_path=BPE_MODEL_PATH,
-            sample_rate=SAMPLE_RATE,
-        )
-        print(f"StreamingInference 模型加载成功")
-        print(f"  - ONNX Model: {ONNX_MODEL_PATH}")
-        print(f"  - BPE Model: {BPE_MODEL_PATH}")
-    except Exception as e:
-        print(f"StreamingInference 模型加载失败: {e}")
-        streaming_inference = None
-
 @app.on_event("startup")
 async def startup_event():
     load_model()
-    load_streaming_inference()
 
 def read_wav_bytes(audio_data: bytes) -> Tuple[np.ndarray, int]:
     """从字节流读取 WAV 音频数据"""
@@ -308,27 +294,13 @@ async def websocket_alignment(websocket: WebSocket):
             del streams[stream_id]
             print(f"[WebSocket] 清理stream: {stream_id}")
 
-@app.websocket("/api/inference/ws")
-async def websocket_inference(websocket: WebSocket):
-    """WebSocket端点：使用 StreamingInference 进行实时推理和对齐"""
+@app.websocket("/api/phoneme/ws")
+async def websocket_phoneme(websocket: WebSocket):
+    """WebSocket端点：使用SimpleOnnxModel获取CTC log_probs，使用StreamingCTCAligner进行对齐"""
     await websocket.accept()
     stream_id = str(id(websocket))
     
-    if streaming_inference is None:
-        print("[WebSocket] 错误: StreamingInference 模型未加载")
-        await safe_send_json(websocket, {"error": "模型未加载"})
-        await websocket.close()
-        return
-    
     try:
-        # 为每个连接创建新的实例（因为每个连接需要独立的状态）
-        inference = StreamingInference(
-            onnx_model_path=ONNX_MODEL_PATH,
-            bpe_model_path=BPE_MODEL_PATH,
-            sample_rate=SAMPLE_RATE,
-        )
-        inference_instances[stream_id] = inference
-        
         # 接收参考文本
         init_data = await websocket.receive_json()
         reference_text = init_data.get("text", "")
@@ -338,49 +310,167 @@ async def websocket_inference(websocket: WebSocket):
             await websocket.close()
             return
         
-        # 初始化对齐任务
-        inference.start_alignment(reference_text)
+        # 加载BPE模型
+        try:
+            sp = spm.SentencePieceProcessor()
+            sp.load(BPE_MODEL_PATH)
+            phoneme_bpe_models[stream_id] = sp
+        except Exception as e:
+            await safe_send_json(websocket, {"error": f"BPE模型加载失败: {str(e)}"})
+            await websocket.close()
+            return
+        
+        # 将文本编码为token IDs
+        target_tokens_list = sp.encode(reference_text)
+        if len(target_tokens_list) == 0:
+            await safe_send_json(websocket, {"error": "文本编码后长度为0"})
+            await websocket.close()
+            return
+        
+        target_tokens = torch.tensor(target_tokens_list, dtype=torch.long)
+        blank_id = sp.piece_to_id("<blk>")
+        
+        # 初始化SimpleOnnxModel
+        try:
+            model = SimpleOnnxModel(ONNX_MODEL_PATH)
+            phoneme_models[stream_id] = model
+        except Exception as e:
+            await safe_send_json(websocket, {"error": f"ONNX模型加载失败: {str(e)}"})
+            await websocket.close()
+            return
+        
+        # 初始化对齐器
+        align_config = AlignConfig()
+        aligner = StreamingCTCAligner(
+            target_tokens=target_tokens,
+            blank_id=blank_id,
+            config=align_config,
+        )
+        phoneme_aligners[stream_id] = aligner
+        
         await safe_send_json(websocket, {"status": "ready"})
         
+        # 音频缓冲区
+        audio_buffer = np.array([], dtype=np.float32)
+        min_chunk_size = int(SAMPLE_RATE * 0.4)  # 0.4秒缓冲
+        last_token_index = -1
+        
         while True:
-            # 接收音频数据
             data = await websocket.receive()
             
             if "bytes" in data:
-                # 接收PCM音频数据（16位小端序）
+                # 接收PCM音频数据
                 audio_bytes = data["bytes"]
                 audio_chunk = parse_audio_from_bytes(audio_bytes)
                 
-                # 处理音频块
-                result = inference.process_audio_chunk(audio_chunk)
+                # 累积音频数据
+                audio_buffer = np.concatenate([audio_buffer, audio_chunk])
                 
-                if result is not None:
-                    # 发送结果
-                    await safe_send_json(websocket, {
-                        "current_phone": result["current_phone"],
-                        "token_index": result["token_index"],
-                        "aligned_text": result["aligned_text"],
-                        "status": "processing"
-                    })
+                # 当累积足够的数据时再处理
+                if len(audio_buffer) >= min_chunk_size:
+                    # 提取fbank特征
+                    audio_tensor = torch.from_numpy(audio_buffer).float()
+                    features = extract_fbank(audio_tensor, SAMPLE_RATE)  # (T, 80)
+                    
+                    # 将特征分割成chunk进行处理
+                    T = model.T  # 45
+                    offset = model.decode_chunk_len  # 32
+                    num_frames = features.shape[0]
+                    
+                    # 计算可以处理的帧数（保留一些帧用于下次处理）
+                    processed_frames = 0
+                    start_idx = 0
+                    while start_idx + T <= num_frames:
+                        chunk_features = features[start_idx:start_idx + T]  # (T, 80)
+                        chunk_features = chunk_features[np.newaxis, :, :]  # (1, T, 80)
+                        
+                        # 推理获取CTC log_probs
+                        log_probs = model(chunk_features)  # (1, chunk_size, vocab_size)
+
+                        def print_ctc(ctc_output, blank_id, sp):
+                            # 调试：显示有意义的帧（非blank概率较高的帧）
+                            log_probs = ctc_output  # ctc_output 已经是 log_softmax 输出
+                            probs = np.exp(log_probs)
+                            T = probs.shape[1]
+                            blank_prob = probs[0, :, blank_id]
+                            
+                            # 统计信息
+                            non_blank_frames = np.sum(blank_prob < 0.5)
+                            
+                            # 只显示非blank概率较高的帧
+                            print("\n有意义的帧 (非blank概率 > 0.1):")
+                            for t in range(T):
+                                blank_p = float(blank_prob[t])
+                                if blank_p < 0.9:  # 只显示非blank概率 > 0.1 的帧
+                                    frame_probs = probs[0, t, :]
+                                    top_k = 3
+                                    top_indices = np.argpartition(frame_probs, -top_k)[-top_k:]
+                                    top_indices = top_indices[np.argsort(frame_probs[top_indices])][::-1]
+                                    top_probs = frame_probs[top_indices]
+                                    
+                                    items = []
+                                    for idx, prob in zip(top_indices, top_probs):
+                                        p = float(prob)
+                                        token_name = sp.id_to_piece(int(idx))
+                                        items.append(f"{token_name}:{p:.2f}")
+                                    
+                                    line = ", ".join(items)
+                                    print(f"  frame {t:3d}: {line}")
+                        
+                        print_ctc(log_probs, blank_id, sp)
+                        # 逐帧调用对齐器
+                        batch_size, T_out, vocab_size = log_probs.shape
+                        for t in range(T_out):
+                            log_probs_t = torch.from_numpy(log_probs[0, t, :]).float()
+                            current_token_index = aligner.step(log_probs_t)
+                            
+                            # 只有当token_index变化时才发送
+                            if current_token_index != last_token_index and current_token_index < len(target_tokens_list):
+                                last_token_index = current_token_index
+                                current_phone = sp.id_to_piece(target_tokens_list[current_token_index])
+                                aligned_text = sp.decode(target_tokens_list[:current_token_index + 1])
+                                
+                                await safe_send_json(websocket, {
+                                    "token_index": int(current_token_index),
+                                    "current_phone": current_phone,
+                                    "aligned_text": aligned_text,
+                                    "status": "processing"
+                                })
+                        
+                        processed_frames += offset
+                        start_idx += offset
+                    
+                    # 保留未处理的音频数据（大约保留最后0.1秒）
+                    keep_samples = int(SAMPLE_RATE * 0.1)
+                    if len(audio_buffer) > keep_samples:
+                        audio_buffer = audio_buffer[-keep_samples:]
+                    # 如果处理了所有数据，清空缓冲区
+                    if processed_frames >= num_frames - T:
+                        audio_buffer = np.array([], dtype=np.float32)
             
             elif "text" in data:
                 # 接收文本消息（如停止信号）
                 msg = json.loads(data["text"])
                 if msg.get("action") == "stop":
-                    print(f"[WebSocket] Stream Stop: {stream_id}")
+                    print(f"[WebSocket] Phoneme Stream Stop: {stream_id}")
                     break
     
     except WebSocketDisconnect:
-        print(f"[WebSocket] 连接断开: {stream_id}")
+        print(f"[WebSocket] Phoneme连接断开: {stream_id}")
     except Exception as e:
-        print(f"[WebSocket] 错误: {e}")
+        print(f"[WebSocket] Phoneme错误: {e}")
         import traceback
         traceback.print_exc()
         await safe_send_json(websocket, {"error": str(e)})
     finally:
-        if stream_id in inference_instances:
-            del inference_instances[stream_id]
-            print(f"[WebSocket] 清理inference实例: {stream_id}")
+        # 清理资源
+        if stream_id in phoneme_models:
+            del phoneme_models[stream_id]
+        if stream_id in phoneme_aligners:
+            del phoneme_aligners[stream_id]
+        if stream_id in phoneme_bpe_models:
+            del phoneme_bpe_models[stream_id]
+        print(f"[WebSocket] 清理phoneme实例: {stream_id}")
 
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
@@ -404,6 +494,12 @@ async def debug_tokens_page():
 async def simple_page():
     """返回简单推理测试页面"""
     with open("static/simple.html", "r", encoding="utf-8") as f:
+        return f.read()
+
+@app.get("/phoneme", response_class=HTMLResponse)
+async def phoneme_page():
+    """返回音素预测页面"""
+    with open("static/phoneme.html", "r", encoding="utf-8") as f:
         return f.read()
 
 # 挂载静态文件
